@@ -28,7 +28,9 @@ import mimetypes
 import os
 import smtplib
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 from email.message import EmailMessage
 from email.utils import formatdate, getaddresses, make_msgid
@@ -188,6 +190,181 @@ def resolve_credentials():
     return username, password
 
 
+# ---------------------------------------------------------------------------
+# Relay certificate trust.
+#
+# Python only trusts CA certificates that are already present in the operating
+# system's store. Windows installs many public root CAs lazily, the first time
+# Windows itself needs them, so Python can fail with CERTIFICATE_VERIFY_FAILED
+# against a perfectly valid server.
+#
+# "sermail --update-certs" fixes that without touching the OS store: it asks
+# Windows to build and validate the relay's certificate chain (which makes
+# Windows fetch the root from Microsoft's trusted root program if needed) and
+# saves the intermediate and root CA certificates to sermail-ca.pem next to
+# this script. Every send trusts that file in addition to the OS store.
+# Nothing is saved unless Windows itself trusts the chain.
+#
+# The file contains only public CA certificates. It can be copied to other
+# servers (Windows or Linux) along with sermail.py.
+# ---------------------------------------------------------------------------
+CA_BUNDLE_NAME = "sermail-ca.pem"
+
+_CHAIN_PS = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$X509 = 'System.Security.Cryptography.X509Certificates'
+$files = @(Get-ChildItem -Path $env:SERMAIL_CERT_DIR -Filter '*.der' | Sort-Object Name)
+$leaf = New-Object "$X509.X509Certificate2" -ArgumentList $files[0].FullName
+$chain = New-Object "$X509.X509Chain"
+$chain.ChainPolicy.RevocationMode = 'NoCheck'
+foreach ($f in ($files | Select-Object -Skip 1)) {
+    $extra = New-Object "$X509.X509Certificate2" -ArgumentList $f.FullName
+    [void]$chain.ChainPolicy.ExtraStore.Add($extra)
+}
+$trusted = $chain.Build($leaf)
+$status = (@($chain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() }) -join '; ')
+$certs = @()
+foreach ($e in $chain.ChainElements) {
+    $c = $e.Certificate
+    $certs += @{
+        subject    = $c.Subject
+        issuer     = $c.Issuer
+        notAfter   = $c.NotAfter.ToUniversalTime().ToString('yyyy-MM-dd')
+        thumbprint = $c.Thumbprint
+        der        = [Convert]::ToBase64String($c.RawData)
+    }
+}
+@{ trusted = $trusted; status = $status; certs = $certs } | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def ca_bundle_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CA_BUNDLE_NAME)
+
+
+def make_tls_context():
+    """OS trust store plus sermail-ca.pem, if that file exists."""
+    context = ssl.create_default_context()
+    path = ca_bundle_path()
+    if os.path.isfile(path):
+        context.load_verify_locations(cafile=path)
+    return context
+
+
+def fetch_presented_chain(host, port, timeout):
+    """Return the DER certificates the relay presents, leaf first (unverified)."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+        smtp.starttls(context=context)
+        sock = smtp.sock
+        chain = []
+        try:
+            if hasattr(sock, "get_unverified_chain"):       # Python 3.13+
+                chain = [bytes(c) for c in sock.get_unverified_chain()]
+            else:                                           # Python 3.10 - 3.12
+                import _ssl
+                chain = [c.public_bytes(_ssl.ENCODING_DER)
+                         for c in sock._sslobj.get_unverified_chain()]
+        except Exception:  # noqa: BLE001 - fall back to the leaf alone
+            chain = []
+        return chain or [sock.getpeercert(binary_form=True)]
+
+
+def verify_relay(host, port, timeout):
+    """Do a fully verified TLS handshake; return the relay cert's expiry text."""
+    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+        smtp.starttls(context=make_tls_context())
+        return smtp.sock.getpeercert().get("notAfter", "unknown")
+
+
+def windows_build_chain(presented):
+    """Have Windows build/validate the chain; return its JSON description."""
+    script = base64.b64encode(_CHAIN_PS.encode("utf-16-le")).decode("ascii")
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, der in enumerate(presented):
+            with open(os.path.join(tmp, "%02d.der" % i), "wb") as fh:
+                fh.write(der)
+        env = dict(os.environ, SERMAIL_CERT_DIR=tmp)
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-EncodedCommand", script],
+                env=env, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SendError("could not run PowerShell: %s" % exc)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise SendError("PowerShell chain check failed: %s"
+                        % (proc.stderr.strip() or "no output"))
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except ValueError:
+        raise SendError("unexpected PowerShell output: %r" % proc.stdout[:200])
+
+
+def write_ca_bundle(ca_certs):
+    """Write the CA certificates as PEM; return True if the file changed."""
+    parts = ["# CA certificates trusted by sermail for the SMTP relay.\n"
+             "# Generated by: sermail --update-certs. Do not edit by hand.\n"]
+    for c in ca_certs:
+        parts.append("\n# Subject: %s\n# Expires: %s\n# SHA-1:   %s\n%s" % (
+            c["subject"], c["notAfter"], c["thumbprint"],
+            ssl.DER_cert_to_PEM_cert(base64.b64decode(c["der"]))))
+    text = "".join(parts)
+    path = ca_bundle_path()
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            if fh.read() == text:
+                return False
+    except (OSError, UnicodeError):
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="ascii", newline="\n") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def update_certs():
+    host = setting("SMTP_HOST", SMTP_HOST)
+    port = setting("SMTP_PORT", SMTP_PORT)
+    timeout = setting("TIMEOUT_SECONDS", TIMEOUT_SECONDS)
+    print("sermail: checking certificate chain of %s:%s" % (host, port))
+
+    if os.name == "nt":
+        info = windows_build_chain(fetch_presented_chain(host, port, timeout))
+        certs = info.get("certs") or []
+        if isinstance(certs, dict):          # PowerShell unwraps 1-item lists
+            certs = [certs]
+        for i, c in enumerate(certs):
+            role = "relay" if i == 0 else ("root" if c["subject"] == c["issuer"]
+                                           else "intermediate")
+            print("  %-12s expires %s  %s" % (role, c["notAfter"], c["subject"]))
+        if not info.get("trusted"):
+            raise SendError("Windows does not trust this chain (%s). "
+                            "Nothing was changed." % (info.get("status") or "unknown reason"))
+        if len(certs) < 2:
+            raise SendError("no CA certificates found in the chain. Nothing was changed.")
+        changed = write_ca_bundle(certs[1:])
+        print("sermail: %s %s" % ("updated" if changed else "already up to date:",
+                                  ca_bundle_path()))
+
+    try:
+        expires = verify_relay(host, port, timeout)
+    except ssl.SSLCertVerificationError as exc:
+        if os.name == "nt":
+            raise SendError("chain still fails verification: %s" % exc)
+        raise SendError(
+            "%s\nThis computer's CA store does not trust the relay. Either "
+            "update the OS CA package (ca-certificates), or copy %s from a "
+            "Windows server where 'sermail --update-certs' succeeded into %s"
+            % (exc, CA_BUNDLE_NAME, os.path.dirname(ca_bundle_path())))
+    print("sermail: OK - relay certificate verifies (relay cert expires %s)" % expires)
+    return EXIT_OK
+
+
 def split_addresses(values):
     """Flatten repeated options and comma/semicolon separated lists."""
     if not values:
@@ -273,7 +450,7 @@ def send(msg, sender_addr, envelope_to, debug=False):
         raise SendError("SMTP credentials are not configured "
                         "(run: sermail --store-credentials)")
 
-    context = ssl.create_default_context()
+    context = make_tls_context()
     with smtplib.SMTP(host, port, timeout=setting("TIMEOUT_SECONDS", TIMEOUT_SECONDS)) as smtp:
         if debug:
             smtp.set_debuglevel(1)
@@ -285,7 +462,8 @@ def send(msg, sender_addr, envelope_to, debug=False):
 
 
 def is_temporary(exc):
-    if isinstance(exc, smtplib.SMTPAuthenticationError):
+    if isinstance(exc, (smtplib.SMTPAuthenticationError,
+                        ssl.SSLCertVerificationError)):
         return False
     if isinstance(exc, smtplib.SMTPResponseException):
         return 400 <= exc.smtp_code < 500
@@ -341,6 +519,10 @@ def parse_args(argv):
     creds.add_argument("--all-users", action="store_true",
                        help="with --store-credentials: let every account on "
                             "this computer use the saved credentials")
+    certs = p.add_argument_group("certificate maintenance")
+    certs.add_argument("--update-certs", action="store_true",
+                       help="check the relay's TLS certificate chain and "
+                            "refresh the CA bundle sermail trusts, then exit")
     return p.parse_args(argv)
 
 
@@ -353,6 +535,12 @@ def main(argv=None):
             print("sermail: %s" % (exc or "cancelled"), file=sys.stderr)
             return EXIT_USAGE
         return EXIT_OK
+    if args.update_certs:
+        try:
+            return update_certs()
+        except (SendError, OSError, smtplib.SMTPException) as exc:
+            print("sermail: certificate update failed: %s" % exc, file=sys.stderr)
+            return EXIT_SEND_FAILED
     try:
         msg, sender_addr, envelope_to = build_message(args)
     except (UsageError, OSError, UnicodeError) as exc:
@@ -378,6 +566,10 @@ def main(argv=None):
                 time.sleep(setting("RETRY_DELAY_SECONDS", RETRY_DELAY_SECONDS))
                 continue
             print("sermail: send failed: %s" % exc, file=sys.stderr)
+            if isinstance(exc, ssl.SSLCertVerificationError):
+                print("sermail: the relay's certificate chain is not trusted "
+                      "on this computer; run: sermail --update-certs",
+                      file=sys.stderr)
             return EXIT_SEND_FAILED
         for addr, (code, reason) in refused.items():
             reason = reason.decode(errors="replace") if isinstance(reason, bytes) else reason

@@ -97,6 +97,38 @@ to one computer, so it cannot be copied between servers and is ignored by git.
 Lookup order: values in `sermail.py` / `SERMAIL_*` environment variables, then
 the per-user file, then the shared file, then `keyring`.
 
+## Relay certificates
+
+Python only trusts CA certificates already in the operating system's store,
+and Windows installs many public roots lazily. If a send fails with
+`CERTIFICATE_VERIFY_FAILED`, or as periodic maintenance, run:
+
+```bat
+sermail --update-certs
+```
+
+On Windows this:
+
+1. Connects to the relay and reads the certificate chain it presents.
+2. Asks Windows to build and validate that chain. Windows fetches the root from
+   Microsoft's trusted root program if it is not installed yet.
+3. Only if Windows trusts the chain, saves the intermediate and root CA
+   certificates to `sermail-ca.pem` next to `sermail.py`.
+4. Does a fully verified test connection and prints each certificate's expiry.
+
+Every send trusts `sermail-ca.pem` in addition to the OS store. The OS
+certificate store is not modified, so no administrator rights are needed
+(only write access to the script folder). PowerShell is used for step 2;
+OpenSSL is not required.
+
+On Linux the command only performs the verified test connection, because the
+system CA package normally already trusts the relay. If it does not, update the
+`ca-certificates` package or copy `sermail-ca.pem` from a Windows server.
+
+`sermail-ca.pem` holds public certificates only, so it can be copied to other
+servers alongside `sermail.py`. To keep it current automatically, schedule
+`sermail --update-certs` monthly; exit code 0 means the relay verifies.
+
 ## Other options
 
 - **`keyring` (Windows or Linux).** `pip install keyring`, set `SMTP_USERNAME`
