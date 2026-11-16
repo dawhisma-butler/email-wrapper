@@ -12,10 +12,10 @@ never need to change when those do.
 
 1. Put `sermail.py` and `sermail.bat` in one folder (e.g. `C:\Scripts\sermail`)
    and, optionally, add that folder to `PATH`.
-2. Edit the **RELAY SETTINGS** block at the top of `sermail.py`: set
-   `SMTP_USERNAME`, `SMTP_PASSWORD` and (optionally) `DEFAULT_FROM`.
-3. Restrict who can read the file, since it holds the password. **Do not commit
-   the filled-in password to git.**
+2. Optionally set `DEFAULT_FROM` in the **RELAY SETTINGS** block at the top of
+   `sermail.py`.
+3. Run `sermail --store-credentials` to save the SER username and password
+   encrypted (see [Encrypted credentials](#encrypted-credentials-windows)).
 
 The sender address must belong to a domain registered with your SER account.
 
@@ -67,20 +67,40 @@ subprocess.run(["sermail.bat", "--to", "ops@example.edu", "--subject", "Done", "
 
 Temporary failures (connection problems, 4xx responses) are retried twice.
 
-## Keeping the password out of the script
+## Encrypted credentials (Windows)
 
-Leave `SMTP_PASSWORD` blank and use either:
+Leave `SMTP_USERNAME` and `SMTP_PASSWORD` blank in `sermail.py` and run this
+once on each server, logged in as the account that runs the jobs:
 
-- **OS credential store (encrypted).** `pip install keyring`, then once, as the
-  account that runs the jobs:
+```bat
+sermail --store-credentials
+```
 
-  ```bat
-  python -m keyring set sermail <SMTP_USERNAME>
-  ```
+It prompts for the SER username and password (typing is hidden) and saves them
+encrypted with the Windows Data Protection API (DPAPI) in
+`%LOCALAPPDATA%\sermail\sermail.cred`. Only that Windows account, on that
+computer, can decrypt the file.
 
-  On Windows this stores the password in Credential Manager, encrypted for that
-  account. Each account that sends mail needs to store it once.
-- **Environment variable** `SERMAIL_SMTP_PASSWORD`.
+If several accounts on the server send mail, store one shared copy instead:
 
-Every setting can be overridden the same way (`SERMAIL_SMTP_HOST`,
-`SERMAIL_SMTP_PORT`, `SERMAIL_SMTP_USERNAME`, `SERMAIL_DEFAULT_FROM`, ...).
+```bat
+sermail --store-credentials --all-users
+```
+
+This writes `sermail.cred` next to `sermail.py`, decryptable by any account on
+that computer (but still not on any other computer). Limit who can read the
+folder with NTFS permissions.
+
+When the SER password changes, re-run the same command. `sermail.cred` is tied
+to one computer, so it cannot be copied between servers and is ignored by git.
+
+Lookup order: values in `sermail.py` / `SERMAIL_*` environment variables, then
+the per-user file, then the shared file, then `keyring`.
+
+## Other options
+
+- **`keyring` (Windows or Linux).** `pip install keyring`, set `SMTP_USERNAME`
+  in the script, then `python -m keyring set sermail <SMTP_USERNAME>`.
+- **Environment variables.** Every setting can be overridden with a
+  `SERMAIL_`-prefixed variable (`SERMAIL_SMTP_HOST`, `SERMAIL_SMTP_PORT`,
+  `SERMAIL_SMTP_USERNAME`, `SERMAIL_SMTP_PASSWORD`, `SERMAIL_DEFAULT_FROM`, ...).

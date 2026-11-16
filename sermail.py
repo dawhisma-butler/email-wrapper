@@ -21,6 +21,9 @@ Exit codes:
 """
 
 import argparse
+import base64
+import getpass
+import json
 import mimetypes
 import os
 import smtplib
@@ -39,9 +42,9 @@ from email.utils import formatdate, getaddresses, make_msgid
 # ============================================================================
 SMTP_HOST = "smtp-us.ser.proofpoint.com"
 SMTP_PORT = 587                 # SER requires STARTTLS on 587
-SMTP_USERNAME = ""              # <-- SER SMTP username
-SMTP_PASSWORD = ""              # <-- SER SMTP password (see README for
-                                #     keeping this out of the script)
+SMTP_USERNAME = ""              # Leave both blank and run
+SMTP_PASSWORD = ""              #   sermail --store-credentials
+                                # to keep them encrypted instead (see README).
 DEFAULT_FROM = ""               # used when --from is not given, e.g.
                                 # "IT Notifications <noreply@example.edu>"
 TIMEOUT_SECONDS = 30
@@ -65,15 +68,124 @@ def setting(name, default):
     return type(default)(value)
 
 
-def resolve_password(username):
-    password = setting("SMTP_PASSWORD", SMTP_PASSWORD)
-    if password:
-        return password
+# ---------------------------------------------------------------------------
+# Encrypted credential storage (Windows DPAPI).
+#
+# "sermail --store-credentials" encrypts the username and password with the
+# Windows Data Protection API and writes the result to a file. The encryption
+# key is managed by Windows and never leaves this computer, so the file is
+# useless if copied elsewhere.
+#   per-user file : only the Windows account that created it can decrypt it
+#   shared file   : any account on this computer can decrypt it (--all-users)
+# ---------------------------------------------------------------------------
+CRED_FILE_NAME = "sermail.cred"
+_DPAPI_UI_FORBIDDEN = 0x1
+_DPAPI_LOCAL_MACHINE = 0x4
+
+
+def user_cred_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "sermail", CRED_FILE_NAME)
+
+
+def shared_cred_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CRED_FILE_NAME)
+
+
+def _dpapi(data, encrypt, machine_scope=False):
+    """Encrypt or decrypt bytes with the Windows Data Protection API."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = Blob()
+    flags = _DPAPI_UI_FORBIDDEN
+    if encrypt:
+        if machine_scope:
+            flags |= _DPAPI_LOCAL_MACHINE
+        ok = crypt32.CryptProtectData(ctypes.byref(blob_in), "sermail", None, None,
+                                      None, flags, ctypes.byref(blob_out))
+    else:
+        ok = crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None,
+                                        None, flags, ctypes.byref(blob_out))
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        import keyring  # optional dependency
-    except ImportError:
-        return ""
-    return keyring.get_password(KEYRING_SERVICE, username) or ""
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def store_credentials(all_users):
+    """Prompt for the SER username/password and save them encrypted."""
+    if os.name != "nt":
+        raise UsageError("--store-credentials uses Windows DPAPI and is only "
+                         "available on Windows (on Linux, see the keyring "
+                         "option in the README)")
+    username = input("SER SMTP username: ").strip()
+    password = getpass.getpass("SER SMTP password (input hidden): ")
+    if not username or not password:
+        raise UsageError("username and password are both required")
+    if getpass.getpass("Re-enter password: ") != password:
+        raise UsageError("passwords did not match; nothing was saved")
+
+    plain = json.dumps({"username": username, "password": password}).encode("utf-8")
+    blob = _dpapi(plain, encrypt=True, machine_scope=all_users)
+    path = shared_cred_path() if all_users else user_cred_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(base64.b64encode(blob))
+    who = ("any account on this computer" if all_users
+           else "only this Windows account (%s)" % getpass.getuser())
+    print("sermail: encrypted credentials saved to %s" % path)
+    print("sermail: they can be decrypted by %s" % who)
+
+
+def load_stored_credentials():
+    """Return (username, password) from an encrypted file, or None."""
+    if os.name != "nt":
+        return None
+    for path in (user_cred_path(), shared_cred_path()):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                plain = _dpapi(base64.b64decode(fh.read()), encrypt=False)
+            data = json.loads(plain.decode("utf-8"))
+            return data["username"], data["password"]
+        except Exception as exc:  # noqa: BLE001
+            raise SendError("cannot decrypt %s (%s); re-run "
+                            "sermail --store-credentials as this account"
+                            % (path, exc))
+    return None
+
+
+def resolve_credentials():
+    """Find the SMTP login: settings/env first, then encrypted file, then keyring."""
+    username = setting("SMTP_USERNAME", SMTP_USERNAME)
+    password = setting("SMTP_PASSWORD", SMTP_PASSWORD)
+    if username and password:
+        return username, password
+    stored = load_stored_credentials()
+    if stored:
+        return stored
+    if username:
+        try:
+            import keyring  # optional dependency
+        except ImportError:
+            pass
+        else:
+            password = keyring.get_password(KEYRING_SERVICE, username) or ""
+    return username, password
 
 
 def split_addresses(values):
@@ -156,11 +268,10 @@ def build_message(args):
 def send(msg, sender_addr, envelope_to, debug=False):
     host = setting("SMTP_HOST", SMTP_HOST)
     port = setting("SMTP_PORT", SMTP_PORT)
-    username = setting("SMTP_USERNAME", SMTP_USERNAME)
-    password = resolve_password(username)
+    username, password = resolve_credentials()
     if not username or not password:
         raise SendError("SMTP credentials are not configured "
-                        "(set SMTP_USERNAME / SMTP_PASSWORD in sermail.py)")
+                        "(run: sermail --store-credentials)")
 
     context = ssl.create_default_context()
     with smtplib.SMTP(host, port, timeout=setting("TIMEOUT_SECONDS", TIMEOUT_SECONDS)) as smtp:
@@ -223,11 +334,25 @@ def parse_args(argv):
                    help="print the SMTP conversation to stderr")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="print nothing on success")
+    creds = p.add_argument_group("credential setup")
+    creds.add_argument("--store-credentials", action="store_true",
+                       help="prompt for the SER username/password and save "
+                            "them encrypted (Windows), then exit")
+    creds.add_argument("--all-users", action="store_true",
+                       help="with --store-credentials: let every account on "
+                            "this computer use the saved credentials")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.store_credentials:
+        try:
+            store_credentials(args.all_users)
+        except (UsageError, OSError, EOFError, KeyboardInterrupt) as exc:
+            print("sermail: %s" % (exc or "cancelled"), file=sys.stderr)
+            return EXIT_USAGE
+        return EXIT_OK
     try:
         msg, sender_addr, envelope_to = build_message(args)
     except (UsageError, OSError, UnicodeError) as exc:
